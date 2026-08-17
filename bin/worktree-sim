@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# Give every Git worktree its own iOS Simulator and DerivedData directory.
+
+set -euo pipefail
+
+die() { echo "worktree-sim: $*" >&2; exit 1; }
+
+ROOT="${WORKTREE_SIM_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+DEVICE_TYPE_NAME="${WORKTREE_SIM_DEVICE:-iPhone 17}"
+CONFIG="${WORKTREE_SIM_CONFIG:-Debug}"
+SCHEME="${WORKTREE_SIM_SCHEME:-}"
+APP_NAME="${WORKTREE_SIM_APP_NAME:-}"
+DEVICE_PREFIX="${WORKTREE_SIM_DEVICE_PREFIX:-Worktree}"
+MODULE_CACHE="${WORKTREE_SIM_MODULE_CACHE:-$HOME/Library/Developer/Xcode/DerivedData/ModuleCache.noindex}"
+
+DD="$ROOT/build/worktree-sim-derived-data"
+CACHE="$ROOT/build/.worktree-sim-udid"
+LOCK="$ROOT/build/.worktree-sim-lock"
+LOG="$ROOT/build/worktree-sim-last-build.log"
+RESULT="$ROOT/build/.worktree-sim-last-build"
+
+discover_container() {
+  local -a projects workspaces
+  if [ -n "${WORKTREE_SIM_WORKSPACE:-}" ]; then
+    BUILD_CONTAINER_ARGS=(-workspace "$WORKTREE_SIM_WORKSPACE")
+    return
+  fi
+  if [ -n "${WORKTREE_SIM_PROJECT:-}" ]; then
+    BUILD_CONTAINER_ARGS=(-project "$WORKTREE_SIM_PROJECT")
+    return
+  fi
+
+  shopt -s nullglob
+  workspaces=("$ROOT"/*.xcworkspace)
+  projects=("$ROOT"/*.xcodeproj)
+  shopt -u nullglob
+  if [ "${#workspaces[@]}" -eq 1 ]; then
+    BUILD_CONTAINER_ARGS=(-workspace "${workspaces[0]}")
+  elif [ "${#projects[@]}" -eq 1 ]; then
+    BUILD_CONTAINER_ARGS=(-project "${projects[0]}")
+  else
+    die "set WORKTREE_SIM_PROJECT or WORKTREE_SIM_WORKSPACE (automatic discovery needs exactly one container)"
+  fi
+}
+
+discover_scheme() {
+  if [ -n "$SCHEME" ]; then return; fi
+  local container="${BUILD_CONTAINER_ARGS[1]}"
+  SCHEME="$(basename "$container")"
+  SCHEME="${SCHEME%.xcodeproj}"
+  SCHEME="${SCHEME%.xcworkspace}"
+}
+
+path_hash() { printf '%s' "$ROOT" | shasum | cut -c1-8; }
+device_label() { printf '%s' "$(basename "$ROOT")" | tr -c '[:alnum:]._-' '-'; }
+DEVICE_NAME="$DEVICE_PREFIX-$(device_label)-$(path_hash)"
+
+newest_ios_runtime() {
+  xcrun simctl list runtimes --json | /usr/bin/python3 -c '
+import json, sys
+runtimes = [item for item in json.load(sys.stdin)["runtimes"]
+            if item.get("isAvailable") and "SimRuntime.iOS-" in item["identifier"]]
+if not runtimes:
+    sys.exit("no iOS Simulator runtime is installed")
+runtimes.sort(key=lambda item: [int(part) for part in item["version"].split(".")])
+print(runtimes[-1]["identifier"])
+'
+}
+
+device_type_id() {
+  xcrun simctl list devicetypes --json | /usr/bin/python3 -c '
+import json, sys
+name = sys.argv[1]
+for item in json.load(sys.stdin)["devicetypes"]:
+    if item["name"] == name:
+        print(item["identifier"])
+        break
+else:
+    sys.exit(f"unknown Simulator device type: {name}")
+' "$DEVICE_TYPE_NAME"
+}
+
+find_device() {
+  xcrun simctl list devices --json | /usr/bin/python3 -c '
+import json, sys
+name = sys.argv[1]
+for devices in json.load(sys.stdin)["devices"].values():
+    for item in devices:
+        if item["name"] == name and item.get("isAvailable"):
+            print(item["udid"])
+            raise SystemExit
+' "$DEVICE_NAME"
+}
+
+ensure_device() {
+  mkdir -p "$ROOT/build"
+  local waited=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    waited=$((waited + 1))
+    [ "$waited" -gt 60 ] && die "timed out waiting for $LOCK"
+    sleep 1
+  done
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+  local id
+  id="$(find_device || true)"
+  if [ -z "$id" ]; then
+    echo "worktree-sim: creating $DEVICE_NAME ($DEVICE_TYPE_NAME)" >&2
+    id="$(xcrun simctl create "$DEVICE_NAME" "$(device_type_id)" "$(newest_ios_runtime)")"
+  fi
+  printf '%s' "$id" > "$CACHE"
+  rmdir "$LOCK" 2>/dev/null || true
+  trap - EXIT
+  printf '%s' "$id"
+}
+
+udid() {
+  if [ -f "$CACHE" ]; then
+    local cached
+    cached="$(<"$CACHE")"
+    if xcrun simctl list devices --json | grep -q "$cached"; then
+      printf '%s' "$cached"
+      return
+    fi
+  fi
+  ensure_device
+}
+
+boot() {
+  local id
+  id="$(udid)"
+  xcrun simctl bootstatus "$id" -b >/dev/null 2>&1 || true
+  printf '%s' "$id"
+}
+
+app_path() {
+  local name="${APP_NAME:-$SCHEME}"
+  printf '%s' "$DD/Build/Products/$CONFIG-iphonesimulator/$name.app"
+}
+
+bundle_id() {
+  local plist
+  plist="$(app_path)/Info.plist"
+  [ -f "$plist" ] || die "built app Info.plist not found at $plist; set WORKTREE_SIM_APP_NAME if needed"
+  /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist"
+}
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+build() {
+  local id rc
+  id="$(udid)"
+  mkdir -p "$MODULE_CACHE"
+  printf 'running %s\n' "$(now)" > "$RESULT"
+  echo "worktree-sim: building $SCHEME for $DEVICE_NAME ($id)" >&2
+
+  set +e
+  xcodebuild \
+    "${BUILD_CONTAINER_ARGS[@]}" \
+    -scheme "$SCHEME" \
+    -configuration "$CONFIG" \
+    -destination "id=$id" \
+    -derivedDataPath "$DD" \
+    MODULE_CACHE_DIR="$MODULE_CACHE" \
+    -quiet \
+    build 2>&1 | tee "$LOG"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  printf '%s %s\n' "$rc" "$(now)" > "$RESULT"
+  [ "$rc" -eq 0 ] || echo "worktree-sim: build failed; full log: $LOG" >&2
+  return "$rc"
+}
+
+run_app() {
+  local id
+  build
+  id="$(boot)"
+  xcrun simctl install "$id" "$(app_path)"
+  xcrun simctl launch "$id" "$(bundle_id)"
+  echo "worktree-sim: launched on $DEVICE_NAME ($id)" >&2
+}
+
+show_last() {
+  [ -f "$RESULT" ] || { echo "no build recorded in this worktree"; exit 2; }
+  local state timestamp
+  read -r state timestamp < "$RESULT"
+  case "$state" in
+    running) echo "build still running (started $timestamp)"; exit 3 ;;
+    0) echo "last build OK ($timestamp)" ;;
+    *) echo "last build FAILED rc=$state ($timestamp); log: $LOG"; exit "$state" ;;
+  esac
+}
+
+release_device() {
+  if [ ! -f "$CACHE" ]; then
+    echo "worktree-sim: nothing to release"
+    return
+  fi
+  local id
+  id="$(<"$CACHE")"
+  xcrun simctl shutdown "$id" 2>/dev/null || true
+  xcrun simctl delete "$id" 2>/dev/null || true
+  rm -f "$CACHE"
+  echo "worktree-sim: deleted $DEVICE_NAME"
+}
+
+discover_container
+discover_scheme
+
+case "${1:-udid}" in
+  udid) udid; echo ;;
+  name) echo "$DEVICE_NAME" ;;
+  dd) echo "$DD" ;;
+  modulecache) echo "$MODULE_CACHE" ;;
+  boot) boot >/dev/null; echo "$DEVICE_NAME booted" ;;
+  build) build ;;
+  run) run_app ;;
+  shot)
+    output="${2:-$ROOT/build/worktree-sim-shot.png}"
+    xcrun simctl io "$(boot)" screenshot "$output"
+    echo "$output"
+    ;;
+  logs)
+    xcrun simctl spawn "$(boot)" log stream --level debug --predicate "process == '$SCHEME'"
+    ;;
+  open) open -a Simulator --args -CurrentDeviceUDID "$(boot)" ;;
+  last) show_last ;;
+  status)
+    xcrun simctl list devices | grep -E "$DEVICE_PREFIX-" || echo "no worktree devices yet"
+    echo "this worktree: $ROOT"
+    echo "device:        $DEVICE_NAME"
+    echo "derived data:  $DD"
+    ;;
+  release) release_device ;;
+  *) die "unknown command '$1'; expected udid, name, dd, modulecache, boot, build, run, shot, logs, open, last, status, or release" ;;
+esac
